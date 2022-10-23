@@ -1,0 +1,223 @@
+trigger:
+  - master
+  - release
+pr:
+  - release
+
+variables:
+  # Container registry service connection established during pipeline creation
+  imageRepository: microfrontend/dockermfe
+  containerRegistry: <here-your-container-registry-connection>
+  tag: '$(Build.BuildId)'
+
+jobs:
+  - job: Config_Build
+    steps:
+      - checkout: self
+        fetchDepth: 0
+      - task: NodeTool@0
+        displayName: 'Use Node 14.17.4'
+        inputs:
+          versionSpec: 14.17.4
+      - task: Npm@1
+        displayName: 'Clear cache'
+        inputs:
+          command: custom
+          verbose: false
+          customCommand: 'cache clean -f'
+      - task: Cache@2
+        displayName: Cache
+        inputs:
+          key: 'npm | $(Agent.OS) | package.json'
+          path: '$(Build.SourcesDirectory)/node_modules'
+          cacheHitVar: CacheRestored
+      - task: Npm@1
+        inputs:
+          command: 'install'
+        name: npm_install
+        condition: ne(variables['CacheRestored'], 'true')
+      - powershell: |
+          npx nx affected:apps --base=HEAD~1 --plain | Tee-Object -Variable output
+          foreach ($appName in ($output -replace '\s+', ' ').Split()) {
+            if($appName.Trim() -eq "frontend"){
+              Write-Host "##vso[task.setvariable variable=appFrontendAffected;isoutput=true]true"
+            }
+            if($appName.Trim() -eq "ApiGateway"){
+              Write-Host "##vso[task.setvariable variable=appApiGatewayAffected;isoutput=true]true"
+            }
+            if($appName.Trim() -eq "Backend"){
+              Write-Host "##vso[task.setvariable variable=appBackendAffected;isoutput=true]true"
+            }
+          }
+        name: affectedApps
+  - job: Build_Frontend
+    dependsOn: Config_Build
+    variables:
+      appFrontendAffected: $[ dependencies.Config_Build.outputs['affectedApps.appFrontendAffected'] ]
+    condition: eq(variables.appFrontendAffected, 'true')
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      - task: NodeTool@0
+        displayName: 'Use Node 14.17.4'
+        inputs:
+          versionSpec: 14.17.4
+      - task: Cache@2
+        displayName: 'Get node_modules'
+        inputs:
+          key: 'npm | $(Agent.OS) | package.json'
+          path: '$(Build.SourcesDirectory)/node_modules'
+          cacheHitVar: CacheRestored
+      - task: Npm@1
+        inputs:
+          command: 'custom'
+          customCommand: 'run build:frontend'
+        name: build
+      - task: CopyFiles@2
+        inputs:
+          SourceFolder: 'dist/apps/frontend'
+          Contents: '**/*'
+          targetFolder: '$(Build.ArtifactStagingDirectory)/dist/apps/frontend' 
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Artifact: drop'
+  - job: Build_ApiGateway
+    dependsOn: Config_Build
+    variables:
+      appApiGatewayAffected: $[ dependencies.Config_Build.outputs['affectedApps.appApiGatewayAffected'] ]
+    condition: eq(variables.appApiGatewayAffected, 'true')
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      - task: NodeTool@0
+        displayName: 'Use Node 14.17.4'
+        inputs:
+          versionSpec: 14.17.4
+      - task: Cache@2
+        displayName: 'Get node_modules'
+        inputs:
+          key: 'npm | $(Agent.OS) | package.json'
+          path: '$(Build.SourcesDirectory)/node_modules'
+          cacheHitVar: CacheRestored
+      - task: Npm@1
+        inputs:
+          command: 'custom'
+          customCommand: 'run build:api-gateway'
+        name: build
+      - task: CopyFiles@2
+        inputs:
+          SourceFolder: 'dist/apps/ApiGateway'
+          Contents: '**/*'
+          targetFolder: '$(Build.ArtifactStagingDirectory)/dist/apps/ApiGateway' 
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Artifact: drop'
+  - job: Build_Backend
+    dependsOn: Config_Build
+    variables:
+      appBackendAffected: $[ dependencies.Config_Build.outputs['affectedApps.appBackendAffected'] ]
+    condition: eq(variables.appBackendAffected, 'true')
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      - task: NodeTool@0
+        displayName: 'Use Node 14.17.4'
+        inputs:
+          versionSpec: 14.17.4
+      - task: Cache@2
+        displayName: 'Get node_modules'
+        inputs:
+          key: 'npm | $(Agent.OS) | package.json'
+          path: '$(Build.SourcesDirectory)/node_modules'
+          cacheHitVar: CacheRestored
+      - task: Npm@1
+        inputs:
+          command: 'custom'
+          customCommand: 'run build:backend'
+        name: build
+      - task: CopyFiles@2
+        inputs:
+          SourceFolder: 'dist/apps/Backend'
+          Contents: '**/*'
+          targetFolder: '$(Build.ArtifactStagingDirectory)/dist/apps/Backend' 
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Artifact: drop'
+  - job: Publish_Frontend
+    dependsOn: Build_Frontend
+    pool:
+      name: Azure Pipelines
+    variables:
+      ImageName: $(imageRepository)/Frontend
+    steps:
+    - task: DownloadBuildArtifacts@0
+      displayName: 'Download Build Artifacts'
+      inputs:
+        itemPattern: '**/dist/apps/frontend/**'
+        artifactName: drop
+        downloadPath: '$(Build.ArtifactStagingDirectory)'
+        extractTars: false
+    - task: Docker@2
+      displayName: build
+      inputs:
+        buildContext: $(Build.ArtifactStagingDirectory)/drop
+        command: buildAndPush
+        Dockerfile: Dockerfile.Frontend
+        repository: $(ImageName)
+        containerRegistry: $(containerRegistry)
+        tags: |
+          $(tag)
+    # De momento no hace falta publicar los artefactos
+    # - task: PublishBuildArtifacts@1
+    #   displayName: 'Publish Image as Artifact'
+  - job: Publish_ApiGateway
+    dependsOn: Build_ApiGateway
+    pool:
+      name: Azure Pipelines
+    variables:
+      ImageName: $(imageRepository)/ApiGateway
+    steps:
+    - task: DownloadBuildArtifacts@0
+      displayName: 'Download Build Artifacts'
+      inputs:
+        itemPattern: '**/dist/apps/ApiGateway/**'
+        artifactName: drop
+        downloadPath: '$(Build.ArtifactStagingDirectory)'
+        extractTars: false
+    - task: Docker@2
+      displayName: build
+      inputs:
+        buildContext: $(Build.ArtifactStagingDirectory)/drop
+        command: buildAndPush
+        Dockerfile: Dockerfile.ApiGateway
+        repository: $(ImageName)
+        containerRegistry: $(containerRegistry)
+        tags: |
+          $(tag)
+    # De momento no hace falta publicar los artefactos
+    # - task: PublishBuildArtifacts@1
+    #   displayName: 'Publish Image as Artifact'
+  - job: Publish_Backend
+    dependsOn: Build_Backend
+    pool:
+      name: Azure Pipelines
+    variables:
+      ImageName: $(imageRepository)/Backend
+    steps:
+    - task: DownloadBuildArtifacts@0
+      displayName: 'Download Build Artifacts'
+      inputs:
+        itemPattern: '**/dist/apps/Backend/**'
+        artifactName: drop
+        downloadPath: '$(Build.ArtifactStagingDirectory)'
+        extractTars: false
+    - task: Docker@2
+      displayName: build
+      inputs:
+        buildContext: $(Build.ArtifactStagingDirectory)/drop
+        command: buildAndPush
+        Dockerfile: Dockerfile.Backend
+        repository: $(ImageName)
+        containerRegistry: $(containerRegistry)
+        tags: |
+          $(tag)
+    # De momento no hace falta publicar los artefactos
+    # - task: PublishBuildArtifacts@1
+    #   displayName: 'Publish Image as Artifact'
